@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import random
+import ipaddress
+import socket
 import re
 import shutil
 import subprocess
@@ -10,6 +12,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlparse
 
 import httpx
 import imageio_ffmpeg
@@ -22,7 +25,7 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 ROOT = Path(os.environ.get("JOBS_DIR", "/tmp/short-render-jobs"))
 ROOT.mkdir(parents=True, exist_ok=True)
 TOKEN = os.environ.get("RENDER_TOKEN", "").strip()
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 RENDER_LOCK = threading.Lock()
 
 HTTP_HEADERS = {
@@ -92,6 +95,32 @@ def probe_duration(path: Path) -> float:
 
 def has_audio(path: Path) -> bool:
     return " Audio: " in probe_text(path)
+
+
+def validate_public_media_url(url: str):
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise RuntimeError("Only public http/https media URLs are supported")
+    if parsed.port not in (None, 80, 443):
+        raise RuntimeError("Only standard HTTP/HTTPS ports are allowed")
+    host = parsed.hostname.lower()
+    if host in {"localhost"} or host.endswith((".local", ".internal", ".localhost")):
+        raise RuntimeError("Private/local hosts are not allowed")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except Exception as e:
+        raise RuntimeError(f"Could not resolve media host: {e}") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise RuntimeError("Private/local IP addresses are not allowed")
 
 
 async def preflight_url(url: str, label: str):
@@ -518,12 +547,9 @@ def health():
     return {"ok": True, "version": VERSION, "queue_locked": RENDER_LOCK.locked()}
 
 @app.get("/check-url")
-async def check_url(
-    url: str = Query(...),
-    authorization: Optional[str] = Header(default=None),
-):
-    require_auth(authorization)
+async def check_url(url: str = Query(...)):
     try:
+        validate_public_media_url(url)
         return await preflight_url(url, "media")
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
