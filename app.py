@@ -29,7 +29,7 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 ROOT = Path(os.environ.get("JOBS_DIR", "/tmp/short-render-jobs"))
 ROOT.mkdir(parents=True, exist_ok=True)
 TOKEN = os.environ.get("RENDER_TOKEN", "").strip()
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 RENDER_LOCK = threading.Lock()
 TRAILER_LOCK = threading.Lock()
 TRAILER_ROOT = ROOT / "trailer-assets"
@@ -200,7 +200,7 @@ def hls_attributes(line: str):
 def validate_apple_url(url: str, media=False):
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    allowed = host in {"tv.apple.com", "play-edge.itunes.apple.com", "play.itunes.apple.com", "vod-ap-amt.tv.apple.com", "vod-ak-amt.tv.apple.com", "vod-fa-amt.tv.apple.com"}
+    allowed = host in {"tv.apple.com", "play-edge.itunes.apple.com", "play.itunes.apple.com", "vod-ap-amt.tv.apple.com", "vod-ak-amt.tv.apple.com", "vod-fa-amt.tv.apple.com", "vod-ap-aoc.tv.apple.com", "vod-ak-aoc.tv.apple.com", "vod-fa-aoc.tv.apple.com"}
     if parsed.scheme != "https" or not allowed or parsed.username or parsed.password or parsed.port not in (None, 443):
         raise RuntimeError("Unexpected host in Apple trailer")
     if media and "/videopreview" not in parsed.path.lower():
@@ -225,7 +225,7 @@ def apple_renditions(master: str, base: str):
             continue
         attr = hls_attributes(line)
         width, height = map(int, attr.get("RESOLUTION", "0x0").split("x"))
-        if width >= 640 and 0 < height <= 1080 and not lines[i + 1].startswith("#"):
+        if width >= 640 and 0 < height <= 1080 and attr.get("VIDEO-RANGE", "SDR") == "SDR" and not lines[i + 1].startswith("#"):
             variants.append((width * height, int(attr.get("BANDWIDTH", 0)), urljoin(base, lines[i + 1]), attr.get("AUDIO")))
     if not variants:
         raise RuntimeError("No usable HD trailer rendition")
