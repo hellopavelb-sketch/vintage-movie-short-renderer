@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 import httpx
 import imageio_ffmpeg
+import yt_dlp
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from PIL import Image, ImageDraw, ImageFont
@@ -25,11 +26,11 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 ROOT = Path(os.environ.get("JOBS_DIR", "/tmp/short-render-jobs"))
 ROOT.mkdir(parents=True, exist_ok=True)
 TOKEN = os.environ.get("RENDER_TOKEN", "").strip()
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 RENDER_LOCK = threading.Lock()
 
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; VintageMovieShortRenderer/1.2)",
+    "User-Agent": "Mozilla/5.0 (compatible; VintageMovieShortRenderer/1.4)",
     "Accept": "*/*",
 }
 
@@ -97,6 +98,14 @@ def has_audio(path: Path) -> bool:
     return " Audio: " in probe_text(path)
 
 
+def is_youtube_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+
+
 def validate_public_media_url(url: str):
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -148,7 +157,31 @@ async def preflight_url(url: str, label: str):
         raise RuntimeError(f"{label} preflight failed: {e}") from e
 
 
+def _download_youtube(url: str, dst: Path):
+    dst.unlink(missing_ok=True)
+    opts = {
+        "format": "best[ext=mp4][height<=1080]/best[height<=1080]/best",
+        "outtmpl": str(dst),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "overwrites": True,
+        "http_headers": {"User-Agent": HTTP_HEADERS["User-Agent"]},
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+    if not dst.exists() or dst.stat().st_size < 100_000:
+        raise RuntimeError("YouTube download did not produce a usable video file")
+
+
 async def download(url: str, dst: Path, label: str):
+    if is_youtube_url(url):
+        try:
+            await asyncio.to_thread(_download_youtube, url, dst)
+            return
+        except Exception as e:
+            raise RuntimeError(f"{label} YouTube download failed: {e}") from e
+
     timeout = httpx.Timeout(240.0, connect=30.0)
     last_error = None
     for attempt in range(1, 4):
@@ -545,6 +578,7 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "version": VERSION, "queue_locked": RENDER_LOCK.locked()}
+
 
 @app.get("/check-url")
 async def check_url(url: str = Query(...)):
