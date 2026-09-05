@@ -53,6 +53,23 @@ class TrailerTests(unittest.TestCase):
                 self.assertEqual(resolve.call_count, 2)
                 self.assertEqual(result.path, output)
 
+    def test_restart_marks_interrupted_jobs_failed(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for state in ("queued", "downloading", "rendering", "completed", "failed"):
+                job = root / state
+                job.mkdir()
+                app.write_status(job / "status.json", status=state)
+            with patch.object(app, "ROOT", root):
+                app.recover_interrupted_jobs()
+            for state in ("queued", "downloading", "rendering"):
+                result = json.loads((root / state / "status.json").read_text())
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("existing presenter", result["error"])
+            for state in ("completed", "failed"):
+                self.assertEqual(json.loads((root / state / "status.json").read_text())["status"], state)
+
 
 if __name__ == "__main__":
     unittest.main()

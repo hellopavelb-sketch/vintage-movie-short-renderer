@@ -22,6 +22,7 @@ The user can name a film or series in chat. The assistant finds and verifies a m
 - Apple does not guarantee trailer coverage for every title or season. Source discovery is performed by the assistant; there is no standalone title-search API in this service.
 - Cached trailers and completed jobs use `JOBS_DIR` (default: temporary storage). They can be lost after a service restart. Save final videos to durable storage; a cache URL is not a permanent archive.
 - This change does not implement Google Drive uploads or repair all n8n polling behavior.
+- Version 1.5.1 limits FFmpeg threads and processes trailer cuts sequentially, avoiding full-trailer frame buffering on the 512 MB server. An interrupted job is marked failed at startup, so a restart cannot leave it indefinitely reporting rendering.
 
 ## Endpoints
 
@@ -38,4 +39,4 @@ Existing `RENDER_TOKEN` authentication applies to preparation and rendering. Con
 ## Validation
 
 Run `python -m unittest discover -s tests` after installing requirements.
-The 1.5.0 integration check downloaded an Apple TV movie trailer (141.76 seconds), decoded it, and rendered a three-second 1080 × 1920 layout with distinct top and bottom sources, without a new HeyGen generation.
+The integration check downloads an Apple TV movie trailer (141.76 seconds), decodes it, and renders a 1080 × 1920 layout with distinct top and bottom sources, without a new HeyGen generation.

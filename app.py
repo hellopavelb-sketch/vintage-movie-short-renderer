@@ -29,7 +29,7 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 ROOT = Path(os.environ.get("JOBS_DIR", "/tmp/short-render-jobs"))
 ROOT.mkdir(parents=True, exist_ok=True)
 TOKEN = os.environ.get("RENDER_TOKEN", "").strip()
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 RENDER_LOCK = threading.Lock()
 TRAILER_LOCK = threading.Lock()
 TRAILER_ROOT = ROOT / "trailer-assets"
@@ -73,7 +73,28 @@ def require_auth(authorization: Optional[str]):
 
 
 def write_status(path: Path, **data):
-    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+@app.on_event("startup")
+def recover_interrupted_jobs():
+    for path in ROOT.glob("*/status.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("status") not in {"completed", "failed"}:
+                write_status(path, status="failed", error="Server restarted before this render finished. Submit the render again using the existing presenter.")
+        except (OSError, ValueError):
+            continue
+
+
+def file_digest(path: Path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
 
 
 def run(cmd):
@@ -456,7 +477,7 @@ def make_master_overlay(path: Path):
 
 
 def make_title(card: TitleCard, path: Path):
-    W, H = 1080, 1920
+    W, H = 1080, 390
     im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
     gold = (203, 137, 34, 255)
@@ -473,10 +494,10 @@ def make_title(card: TitleCard, path: Path):
         d.text((x, y - th // 2 - b[1]), text, font=f, fill=fill)
         return x, tw
 
-    x1, w1 = draw_center(line1, 950, f1, gold)
-    draw_center(line2, 1072, f2, cream)
-    d.line((146, 952, max(146, x1 - 24), 952), fill=gold, width=2)
-    d.line((min(934, x1 + w1 + 24), 952, 934, 952), fill=gold, width=2)
+    x1, w1 = draw_center(line1, 92, f1, gold)
+    draw_center(line2, 214, f2, cream)
+    d.line((146, 94, max(146, x1 - 24), 94), fill=gold, width=2)
+    d.line((min(934, x1 + w1 + 24), 94, 934, 94), fill=gold, width=2)
     im.save(path)
 
 
@@ -542,6 +563,31 @@ def normalize_clips(clips, target, trailer_duration):
     return fixed
 
 
+def assemble_trailer(job: Path, trailer: Path, clips, trailer_has_audio: bool):
+    """Seek and render each cut separately to avoid buffering a full HD trailer."""
+    pieces = []
+    for i, (start, end) in enumerate(clips):
+        piece = job / f"cut_{i:03d}.mp4"
+        duration = end - start
+        cmd = [FFMPEG, "-y", "-filter_threads", "1", "-ss", f"{start:.3f}",
+               "-threads", "1", "-i", str(trailer)]
+        if not trailer_has_audio:
+            cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+        cmd += ["-map", "0:v:0", "-map", "0:a:0" if trailer_has_audio else "1:a:0",
+                "-t", f"{duration:.3f}",
+                "-vf", "scale=840:796:force_original_aspect_ratio=increase,crop=840:796,fps=24,setsar=1,eq=contrast=1.06:brightness=-0.018:saturation=0.82,vignette=PI/5",
+                "-af", "apad", "-ar", "48000", "-ac", "2",
+                "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", str(piece)]
+        run(cmd)
+        pieces.append(piece)
+    listing = job / "cuts.txt"
+    listing.write_text("".join(f"file '{piece.name}'\n" for piece in pieces), encoding="utf-8")
+    assembled = job / "trailer-cut.mp4"
+    run([FFMPEG, "-y", "-f", "concat", "-safe", "1", "-i", str(listing), "-c", "copy", str(assembled)])
+    return assembled
+
+
 def build_render(job_id: str, req: RenderRequest, presenter: Path, trailer: Path, started: float):
     job = ROOT / job_id
     status_path = job / "status.json"
@@ -567,44 +613,20 @@ def build_render(job_id: str, req: RenderRequest, presenter: Path, trailer: Path
         title_paths.append(p)
 
     write_status(status_path, status="rendering")
+    trailer_cut = assemble_trailer(job, trailer, clips, trailer_has_audio)
     output_name = Path(req.output_name).name or "final_short.mp4"
     out = job / output_name
 
     cmd = [
-        FFMPEG, "-y",
-        "-i", str(trailer),
-        "-i", str(presenter),
-        "-framerate", "24", "-loop", "1", "-i", str(master),
+        FFMPEG, "-y", "-filter_complex_threads", "1",
+        "-threads", "1", "-i", str(trailer_cut),
+        "-threads", "1", "-i", str(presenter),
+        "-threads", "1", "-i", str(master),
     ]
     for p in title_paths:
-        cmd += ["-framerate", "24", "-loop", "1", "-i", str(p)]
+        cmd += ["-threads", "1", "-i", str(p)]
 
-    n = len(clips)
-    fc = [f"[0:v]split={n}" + "".join(f"[tv{i}]" for i in range(n))]
-    if trailer_has_audio:
-        fc.append(f"[0:a]asplit={n}" + "".join(f"[ta{i}]" for i in range(n)))
-
-    concat_parts = []
-    for i, (s, e) in enumerate(clips):
-        fc.append(
-            f"[tv{i}]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS,"
-            "scale=840:796:force_original_aspect_ratio=increase,crop=840:796,fps=24,"
-            "eq=contrast=1.06:brightness=-0.018:saturation=0.82,vignette=PI/5"
-            f"[v{i}]"
-        )
-        if trailer_has_audio:
-            fc.append(
-                f"[ta{i}]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[a{i}]"
-            )
-            concat_parts += [f"[v{i}]", f"[a{i}]"]
-        else:
-            concat_parts += [f"[v{i}]"]
-
-    if trailer_has_audio:
-        fc.append("".join(concat_parts) + f"concat=n={n}:v=1:a=1[trv][tra]")
-    else:
-        fc.append("".join(concat_parts) + f"concat=n={n}:v=1:a=0[trv]")
-        fc.append(f"anullsrc=r=48000:cl=stereo:d={target:.3f}[tra]")
+    fc = ["[0:v]setpts=PTS-STARTPTS[trv]", "[0:a]asetpts=PTS-STARTPTS[tra]"]
 
     fc.append(
         f"[1:v]trim=duration={target:.3f},setpts=PTS-STARTPTS,"
@@ -615,7 +637,7 @@ def build_render(job_id: str, req: RenderRequest, presenter: Path, trailer: Path
     fc.append("[bg][trv]overlay=x=118:y=62:shortest=1[s1]")
     fc.append("[s1][pv]overlay=x=118:y=1248:shortest=1[s2]")
     fc.append("[2:v]format=rgba[master]")
-    fc.append("[s2][master]overlay=0:0:shortest=1[s3]")
+    fc.append("[s2][master]overlay=0:0:repeatlast=1[s3]")
 
     prev = "s3"
     for i, card in enumerate(titles):
@@ -623,7 +645,7 @@ def build_render(job_id: str, req: RenderRequest, presenter: Path, trailer: Path
         out_name = f"s{4 + i}"
         fc.append(f"[{inp}:v]format=rgba[t{i}]")
         fc.append(
-            f"[{prev}][t{i}]overlay=0:0:"
+            f"[{prev}][t{i}]overlay=0:858:repeatlast=1:"
             f"enable='between(t,{card.start:.3f},{card.end:.3f})'[{out_name}]"
         )
         prev = out_name
@@ -649,6 +671,7 @@ def build_render(job_id: str, req: RenderRequest, presenter: Path, trailer: Path
         "-t", f"{target:.3f}",
         "-c:v", "libx264",
         "-preset", "ultrafast",
+        "-threads", "1",
         "-crf", "22",
         "-c:a", "aac",
         "-b:a", "160k",
@@ -686,7 +709,7 @@ def render_job(job_id: str, req: RenderRequest):
             trailer = job / "trailer.mp4"
             asyncio.run(download(req.presenter_url, presenter, "presenter"))
             asyncio.run(download(req.trailer_url, trailer, "trailer"))
-            if hashlib.sha256(presenter.read_bytes()).digest() == hashlib.sha256(trailer.read_bytes()).digest():
+            if file_digest(presenter) == file_digest(trailer):
                 raise RuntimeError("Presenter and trailer contain the same video")
             build_render(job_id, req, presenter, trailer, started)
         except Exception as e:
