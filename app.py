@@ -26,7 +26,7 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 ROOT = Path(os.environ.get("JOBS_DIR", "/tmp/short-render-jobs"))
 ROOT.mkdir(parents=True, exist_ok=True)
 TOKEN = os.environ.get("RENDER_TOKEN", "").strip()
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 RENDER_LOCK = threading.Lock()
 
 HTTP_HEADERS = {
@@ -649,6 +649,7 @@ async def render(
         "job_id": job_id,
         "status_url": f"/status/{job_id}",
         "download_url": f"/download/{job_id}",
+        "public_download_url": f"/public-download/{job_id}",
     }
 
 
@@ -704,29 +705,47 @@ def status(job_id: str, authorization: Optional[str] = Header(default=None)):
     return data
 
 
+def _resolve_output(job_id: str):
+    if not re.fullmatch(r"[0-9a-f]{32}", job_id):
+        raise HTTPException(404, "Job not found")
+    job = ROOT / job_id
+    status_path = job / "status.json"
+    if not status_path.exists():
+        raise HTTPException(404, "Job not found")
+    data = json.loads(status_path.read_text(encoding="utf-8"))
+    if data.get("status") == "failed":
+        raise HTTPException(status_code=422, detail=data)
+    output_name = Path(data.get("output_name", "final_short.mp4")).name
+    output = job / output_name
+    return data, output_name, output
+
+
 @app.get("/download/{job_id}")
 def download_result(job_id: str, authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
-    job = ROOT / job_id
-    status_path = job / "status.json"
-
     deadline = time.time() + 300
     while time.time() < deadline:
-        if status_path.exists():
-            data = json.loads(status_path.read_text(encoding="utf-8"))
-            if data.get("status") == "failed":
-                raise HTTPException(status_code=422, detail=data)
-            output_name = Path(data.get("output_name", "final_short.mp4")).name
-        else:
-            output_name = "final_short.mp4"
-
-        output = job / output_name
+        try:
+            data, output_name, output = _resolve_output(job_id)
+        except HTTPException as e:
+            if e.status_code != 404:
+                raise
+            time.sleep(2)
+            continue
         if output.exists() and output.stat().st_size > 10_000:
             return FileResponse(output, media_type="video/mp4", filename=output_name)
-
         time.sleep(2)
+    raise HTTPException(status_code=408, detail="Video is still rendering; retry download shortly")
 
-    raise HTTPException(
-        status_code=408,
-        detail="Video is still rendering; retry download shortly",
+
+@app.get("/public-download/{job_id}")
+def public_download_result(job_id: str):
+    data, output_name, output = _resolve_output(job_id)
+    if data.get("status") != "completed" or not output.exists() or output.stat().st_size <= 10_000:
+        raise HTTPException(status_code=409, detail="Video is not ready yet")
+    return FileResponse(
+        output,
+        media_type="video/mp4",
+        filename=output_name,
+        headers={"Cache-Control": "no-store"},
     )
