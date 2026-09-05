@@ -10,9 +10,12 @@ import subprocess
 import threading
 import time
 import uuid
+import hashlib
+import ssl
+import urllib.request
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import httpx
 import imageio_ffmpeg
@@ -26,8 +29,12 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 ROOT = Path(os.environ.get("JOBS_DIR", "/tmp/short-render-jobs"))
 ROOT.mkdir(parents=True, exist_ok=True)
 TOKEN = os.environ.get("RENDER_TOKEN", "").strip()
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 RENDER_LOCK = threading.Lock()
+TRAILER_LOCK = threading.Lock()
+TRAILER_ROOT = ROOT / "trailer-assets"
+TRAILER_ROOT.mkdir(parents=True, exist_ok=True)
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://vintage-movie-short-renderer.onrender.com").rstrip("/")
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; VintageMovieShortRenderer/1.4)",
@@ -147,6 +154,8 @@ async def preflight_url(url: str, label: str):
                         break
                 if len(first) < 256:
                     raise RuntimeError(f"{label} URL returned too little data")
+                if b"ftyp" not in first[:64] and not first.startswith(b"\x1aE\xdf\xa3"):
+                    raise RuntimeError(f"{label} is not a direct video file; a webpage or playlist cannot be used as MP4")
                 return {
                     "ok": True,
                     "status_code": r.status_code,
@@ -155,6 +164,175 @@ async def preflight_url(url: str, label: str):
                 }
     except Exception as e:
         raise RuntimeError(f"{label} preflight failed: {e}") from e
+
+
+def reject_presenter_as_trailer(url: str):
+    host = (urlparse(url).hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in ("heygen.ai", "heygen.com")):
+        raise RuntimeError("The trailer points to HeyGen presenter footage. Choose a trailer source before generating the presenter.")
+
+
+def hls_attributes(line: str):
+    return {k: v.strip('"') for k, v in re.findall(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', line)}
+
+
+def validate_apple_url(url: str, media=False):
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    allowed = host in {"tv.apple.com", "play-edge.itunes.apple.com", "play.itunes.apple.com", "vod-ap-amt.tv.apple.com", "vod-ak-amt.tv.apple.com", "vod-fa-amt.tv.apple.com"}
+    if parsed.scheme != "https" or not allowed or parsed.username or parsed.password or parsed.port not in (None, 443):
+        raise RuntimeError("Unexpected host in Apple trailer")
+    if media and "/videopreview" not in parsed.path.lower():
+        raise RuntimeError("Only public Apple VideoPreview media is supported")
+
+
+def apple_preview_playlist(page: str):
+    urls = list(dict.fromkeys(json.loads('"' + value + '"') for value in re.findall(r'"hlsUrl"\s*:\s*"((?:\\.|[^"\\])*)"', page)))
+    if len(urls) != 1:
+        raise RuntimeError("The trailer page must contain exactly one video preview")
+    validate_apple_url(urls[0])
+    return urls[0]
+
+
+def apple_renditions(master: str, base: str):
+    if not master.startswith("#EXTM3U") or "#EXT-X-SESSION-KEY" in master:
+        raise RuntimeError("Invalid or protected trailer playlist")
+    lines = master.splitlines()
+    variants = []
+    for i, line in enumerate(lines[:-1]):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        attr = hls_attributes(line)
+        width, height = map(int, attr.get("RESOLUTION", "0x0").split("x"))
+        if width >= 640 and 0 < height <= 1080 and not lines[i + 1].startswith("#"):
+            variants.append((width * height, int(attr.get("BANDWIDTH", 0)), urljoin(base, lines[i + 1]), attr.get("AUDIO")))
+    if not variants:
+        raise RuntimeError("No usable HD trailer rendition")
+    _, _, video, group = max(variants)
+    audio = None
+    for line in lines:
+        if line.startswith("#EXT-X-MEDIA:"):
+            attr = hls_attributes(line)
+            if attr.get("TYPE") == "AUDIO" and attr.get("GROUP-ID") == group and attr.get("URI"):
+                audio = urljoin(base, attr["URI"])
+                if attr.get("DEFAULT") == "YES":
+                    break
+    return video, audio
+
+
+def apple_segments(playlist: str, base: str):
+    if not playlist.startswith("#EXTM3U") or "#EXT-X-ENDLIST" not in playlist:
+        raise RuntimeError("Only finite video previews are supported")
+    if "#EXT-X-BYTERANGE" in playlist:
+        raise RuntimeError("Byte-range trailer playlists are not supported")
+    duration = sum(float(x) for x in re.findall(r"#EXTINF:([0-9.]+)", playlist))
+    if not 5 <= duration <= 300:
+        raise RuntimeError("Trailer duration must be between 5 seconds and 5 minutes")
+    urls = []
+    for line in playlist.splitlines():
+        if line.startswith("#EXT-X-KEY:") and hls_attributes(line).get("METHOD") != "NONE":
+            raise RuntimeError("Protected media is not supported")
+        if line.startswith("#EXT-X-MAP:"):
+            urls.append(urljoin(base, hls_attributes(line)["URI"]))
+        elif line.strip() and not line.startswith("#"):
+            urls.append(urljoin(base, line.strip()))
+    if not urls or len(urls) > 180:
+        raise RuntimeError("Unexpected trailer segment count")
+    for url in urls:
+        validate_apple_url(url, media=True)
+    return urls
+
+
+async def apple_bytes(url, limit=4 * 1024 * 1024, media=False):
+    # Validate each redirect, and never forward account cookies or credentials.
+    class SafeRedirect(urllib.request.HTTPRedirectHandler):
+        max_repeats = 4
+        max_redirections = 4
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            validate_apple_url(newurl, media=media)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    def read():
+        validate_apple_url(url, media=media)
+        opener = urllib.request.build_opener(SafeRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        with opener.open(urllib.request.Request(url, headers=HTTP_HEADERS), timeout=35) as response:
+            data = response.read(limit + 1)
+            if len(data) > limit:
+                raise RuntimeError("Trailer resource exceeds size limit")
+            return data
+
+    return await asyncio.to_thread(read)
+
+
+async def download_apple_preview(url: str, destination: Path):
+    validate_apple_url(url)
+    parsed = urlparse(url)
+    if parsed.hostname != "tv.apple.com" or not re.match(r"^/[a-z]{2}/clip/", parsed.path):
+        raise RuntimeError("Use the public Apple TV trailer /clip/ page, not the full film page")
+    page = (await apple_bytes(url)).decode("utf-8")
+    playlist_url = apple_preview_playlist(page)
+    master = (await apple_bytes(playlist_url)).decode("utf-8")
+    video_url, audio_url = apple_renditions(master, playlist_url)
+    total_bytes = 0
+    parts = []
+    try:
+        for index, media_url in enumerate([video_url, audio_url]):
+            if not media_url:
+                continue
+            manifest = (await apple_bytes(media_url, media=True)).decode("utf-8")
+            segments = apple_segments(manifest, media_url)
+            target = destination.with_suffix(f".{index}.media")
+            parts.append(target)
+            with target.open("wb") as output:
+                for start in range(0, len(segments), 4):
+                    blobs = await asyncio.gather(*(apple_bytes(item, 24 * 1024 * 1024, True) for item in segments[start:start + 4]))
+                    for blob in blobs:
+                        total_bytes += len(blob)
+                        if total_bytes > 250 * 1024 * 1024:
+                            raise RuntimeError("Trailer exceeds 250 MB limit")
+                        output.write(blob)
+        cmd = [FFMPEG, "-y", "-i", str(parts[0])]
+        if len(parts) > 1:
+            cmd += ["-i", str(parts[1]), "-map", "0:v:0", "-map", "1:a:0"]
+        else:
+            cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+        cmd += ["-c", "copy", "-movflags", "+faststart", str(destination)]
+        await asyncio.to_thread(run, cmd)
+    finally:
+        for part in parts:
+            part.unlink(missing_ok=True)
+
+def prepare_trailer_asset(url: str):
+    reject_presenter_as_trailer(url)
+    if (urlparse(url).hostname or "").lower() == "tv.apple.com":
+        validate_apple_url(url)
+    else:
+        validate_public_media_url(url)
+    asset_id = hashlib.sha256(url.encode()).hexdigest()
+    target = TRAILER_ROOT / f"{asset_id}.mp4"
+    with TRAILER_LOCK:
+        if not target.exists():
+            temporary = target.with_suffix(".partial.mp4")
+            try:
+                if (urlparse(url).hostname or "").lower() == "tv.apple.com":
+                    asyncio.run(download_apple_preview(url, temporary))
+                else:
+                    asyncio.run(preflight_url(url, "trailer"))
+                    asyncio.run(download(url, temporary, "trailer"))
+                duration = probe_duration(temporary)
+                if not 5 <= duration <= 300 or " Video: " not in probe_text(temporary):
+                    raise RuntimeError("Source is not a usable short trailer")
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
+    return {
+        "ok": True,
+        "source_url": url,
+        "trailer_url": f"{PUBLIC_BASE_URL}/trailer-assets/{asset_id}",
+        "duration": probe_duration(target),
+        "bytes": target.stat().st_size,
+    }
 
 
 def _download_youtube(url: str, dst: Path):
@@ -508,6 +686,8 @@ def render_job(job_id: str, req: RenderRequest):
             trailer = job / "trailer.mp4"
             asyncio.run(download(req.presenter_url, presenter, "presenter"))
             asyncio.run(download(req.trailer_url, trailer, "trailer"))
+            if hashlib.sha256(presenter.read_bytes()).digest() == hashlib.sha256(trailer.read_bytes()).digest():
+                raise RuntimeError("Presenter and trailer contain the same video")
             build_render(job_id, req, presenter, trailer, started)
         except Exception as e:
             elapsed = round(time.time() - started, 2)
@@ -589,6 +769,25 @@ async def check_url(url: str = Query(...)):
         raise HTTPException(status_code=422, detail=str(e))
 
 
+@app.get("/prepare-trailer")
+def prepare_trailer(url: str = Query(...), authorization: Optional[str] = Header(default=None)):
+    require_auth(authorization)
+    try:
+        return prepare_trailer_asset(url)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.get("/trailer-assets/{asset_id}")
+def trailer_asset(asset_id: str):
+    if not re.fullmatch(r"[0-9a-f]{64}", asset_id):
+        raise HTTPException(404, "Trailer not found")
+    path = TRAILER_ROOT / f"{asset_id}.mp4"
+    if not path.exists():
+        raise HTTPException(404, "Trailer cache expired; prepare the source again")
+    return FileResponse(path, media_type="video/mp4", filename="trailer.mp4")
+
+
 @app.get("/diagnostics")
 def diagnostics(authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
@@ -631,6 +830,11 @@ async def render(
     require_auth(authorization)
 
     try:
+        reject_presenter_as_trailer(req.trailer_url)
+        if req.presenter_url == req.trailer_url:
+            raise RuntimeError("Presenter and trailer must be different videos")
+        validate_public_media_url(req.presenter_url)
+        validate_public_media_url(req.trailer_url)
         await asyncio.gather(
             preflight_url(req.presenter_url, "presenter"),
             preflight_url(req.trailer_url, "trailer"),
@@ -732,7 +936,7 @@ def download_result(job_id: str, authorization: Optional[str] = Header(default=N
                 raise
             time.sleep(2)
             continue
-        if output.exists() and output.stat().st_size > 10_000:
+        if data.get("status") == "completed" and output.exists() and output.stat().st_size > 10_000:
             return FileResponse(output, media_type="video/mp4", filename=output_name)
         time.sleep(2)
     raise HTTPException(status_code=408, detail="Video is still rendering; retry download shortly")
